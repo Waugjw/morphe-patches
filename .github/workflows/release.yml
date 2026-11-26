@@ -10,10 +10,44 @@ on:
   push:
     branches:
       - main
+      - feat/restore-queue-4863
 
 jobs:
+  build_artifact:
+    name: Build patch bundle
+    if: github.repository != 'MorpheApp/morphe-patches' || github.ref_name == 'feat/restore-queue-4863'
+    permissions:
+      contents: read
+      packages: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Cache Gradle
+        uses: burrunan/gradle-cache-action@v3
+
+      - name: Build Android bundle
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./gradlew :patches:buildAndroid -PpatchesName="Morphe Test Build" --no-daemon
+
+      - name: Upload patch bundle
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          if-no-files-found: error
+          path: patches/build/libs/patches-*.mpp
+
   release:
     name: Release
+    if: github.repository == 'MorpheApp/morphe-patches' && github.ref_name != 'feat/restore-queue-4863'
     permissions:
       contents: write
       packages: write
