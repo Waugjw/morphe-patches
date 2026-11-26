@@ -124,16 +124,8 @@ public final class CaptionTracks {
         }
     }
 
-    @SuppressWarnings("ClassCanBeRecord")
-    static final class Captured {
-        final Track track;
-        final StableCaptionBlockPolicy policy;
-
-        Captured(Track track, StableCaptionBlockPolicy policy) {
-            this.track = track;
-            this.policy = policy;
-        }
-    }
+    record Captured(Track track, StableCaptionBlockPolicy policy,
+                    List<StableCaptionBlockPolicy.Block> blocks) {}
 
     /**
      * @return If a secondary language is selected, whether the captions menu toggle is on or off.
@@ -189,8 +181,8 @@ public final class CaptionTracks {
                 if (!isCurrent(previous) || (enabled && previous.translated)) continue;
 
                 Track next = previous.withSecondary(secondaryLanguage());
-                state.captured = new Captured(next, captured.policy);
-                attachTranslation(next, captured.policy, state);
+                state.captured = new Captured(next, captured.policy, captured.blocks);
+                attachTranslation(next, captured, state);
                 CaptionSession translation = state.translation;
                 if (translation != null) translation.demand(entry.getValue());
             }
@@ -362,7 +354,7 @@ public final class CaptionTracks {
         invalidateTranslation();
         for (StableCaptionBlocks.State state : cached) {
             Captured captured = state.captured;
-            if (captured != null) attachTranslation(selected, captured.policy, state);
+            if (captured != null) attachTranslation(selected, captured, state);
         }
         translationChanged(translatedToken);
         return true;
@@ -429,7 +421,7 @@ public final class CaptionTracks {
                     || !track.source.equals(captured.track.source)
                     || !track.language.equals(captured.track.language)) return;
 
-            attachTranslation(track, captured.policy, state);
+            attachTranslation(track, captured, state);
         } catch (Exception ex) {
             Logger.printException(() -> "onNativeResult failure", ex);
         }
@@ -480,28 +472,29 @@ public final class CaptionTracks {
         Object token = new Object();
         nativeSourceRequests.put(timeline, token);
         Utils.runOnBackgroundThread(() -> {
-            StableCaptionBlockPolicy captured = null;
+            Captured captured = null;
             try {
-                captured = StableCaptionBlockPolicy.fromNative(timeline, () -> {
+                StableCaptionBlockPolicy policy = StableCaptionBlockPolicy.fromNative(timeline, () -> {
                     synchronized (CaptionTracks.class) {
                         return nativeSourceRequests.get(timeline) == token && isCurrent(track);
                     }
                 });
+                if (policy != null) captured = new Captured(track, policy, policy.sourceBlocks(track.language));
             } catch (Exception ex) {
                 Logger.printException(() -> "captureNativeSource failure", ex);
             }
-            StableCaptionBlockPolicy policy = captured;
+            Captured prepared = captured;
             Utils.runOnMainThread(() -> {
                 synchronized (CaptionTracks.class) {
                     if (nativeSourceRequests.get(timeline) != token) return;
                     nativeSourceRequests.remove(timeline);
-                    if (policy == null || !isCurrent(track)) return;
+                    if (prepared == null || !isCurrent(track)) return;
                     StableCaptionBlocks.State state = new StableCaptionBlocks.State(false);
                     state.nativeSource = true;
-                    state.policy = policy;
-                    state.captured = new Captured(track, policy);
+                    state.policy = prepared.policy;
+                    state.captured = prepared;
                     timeline.patch_setBlockState(state);
-                    if (dualCaptionEnabled()) attachTranslation(track.withSecondary(secondaryLanguage()), policy, state);
+                    if (dualCaptionEnabled()) attachTranslation(track.withSecondary(secondaryLanguage()), prepared, state);
                 }
                 if (dualCaptionEnabled()) reloadUploaded();
             });
@@ -518,12 +511,13 @@ public final class CaptionTracks {
     /**
      * Called with the document of the track given to {@link #setTrack(Object)}.
      */
-    static synchronized void observe(@Nullable Document document, @Nullable StableCaptionBlocks.State state) {
+    static void observe(@Nullable Document document, @Nullable StableCaptionBlocks.State state) {
         Track track = parsing.get();
         parsing.remove();
         if (track == null) return;
-        boolean current = isCurrent(track);
 
+        // XML traversal and block planning can be slow. A video ID change must be able to
+        // reset the caption selection while the parser is working.
         StableCaptionBlockPolicy primary;
         if (state != null && state.policy != null) {
             primary = state.policy;
@@ -532,17 +526,19 @@ public final class CaptionTracks {
                     ? StableCaptionBlockPolicy.parseSource(document)
                     : StableCaptionBlockPolicy.parseManual(document);
         }
-        if (primary == null) {
-            if (current) invalidateTranslation();
-            return;
+        Captured captured = primary == null || state == null ? null
+                : new Captured(track, primary, primary.sourceBlocks(track.language));
+        synchronized (CaptionTracks.class) {
+            boolean current = isCurrent(track);
+            if (primary == null) {
+                if (current) invalidateTranslation();
+            } else if (captured != null) {
+                // A native prefetch may later be selected from the native parsed-result cache.
+                state.captured = captured;
+                state.policy = primary;
+                if (current) attachTranslation(track, captured, state);
+            }
         }
-
-        // A native prefetch may later be selected from the native parsed-result cache.
-        if (state != null) {
-            state.captured = new Captured(track, primary);
-            state.policy = primary;
-        }
-        if (current) attachTranslation(track, primary, state);
     }
 
     /**
@@ -557,7 +553,7 @@ public final class CaptionTracks {
         String secondary = secondaryLanguage();
         if (secondary != null && captured.track.translated) return false;
 
-        attachTranslation(captured.track.withSecondary(secondary), captured.policy, state);
+        attachTranslation(captured.track.withSecondary(secondary), captured, state);
         CaptionSession translation = state.translation;
         return translation != null && translation.isActive();
     }
@@ -576,10 +572,7 @@ public final class CaptionTracks {
         }
     }
 
-    private static void attachTranslation(Track track, StableCaptionBlockPolicy policy,
-                                          @Nullable StableCaptionBlocks.State state) {
-        if (state == null) return;
-
+    private static void attachTranslation(Track track, Captured captured, StableCaptionBlocks.State state) {
         String primary = track.source.equals(requestedSource) ? requestedTarget : track.language;
         if (track.secondary != null && !track.source.equals(requestedSource)) {
             primary = PreferredCaptionLanguagePatch.blockTranslationTarget(
@@ -594,15 +587,15 @@ public final class CaptionTracks {
         String key = track.source + "|" + track.language + "|" + primary + "|" + track.secondary
                 + "|" + firstUploaded + "|" + secondUploaded;
         if (translatedSession == null || !translatedSession.isActive()
-                || translatedPolicy != policy || !key.equals(translatedKey)) {
+                || translatedPolicy != captured.policy || !key.equals(translatedKey)) {
             invalidateTranslation();
 
             Object token = new Object();
             translatedToken = token;
             translatedKey = key;
-            translatedPolicy = policy;
+            translatedPolicy = captured.policy;
             translatedSession = new CaptionSession(
-                    policy.sourceBlocks(track.language),
+                    captured.blocks,
                     track.language,
                     primary,
                     track.secondary,
@@ -613,7 +606,7 @@ public final class CaptionTracks {
         }
 
         state.translation = translatedSession;
-        state.policy = policy;
+        state.policy = captured.policy;
 
         translatedStates.removeIf(reference -> reference.get() == null || reference.get() == state);
         if (translatedStates.size() == MAX_BOUND_STATES) translatedStates.remove(0);
@@ -648,14 +641,18 @@ public final class CaptionTracks {
      * can show uploaded text instead of a machine translation.
      * Called when the subtitle manager selects a track.
      */
-    static synchronized void inspectUploadedTracks(
+    static void inspectUploadedTracks(
             PreferredCaptionLanguagePatch.SubtitleManagerInterface manager,
             @Nullable PreferredCaptionLanguagePatch.CaptionTrackInterface selected) {
         if (!Settings.DUAL_CAPTIONS_ENABLED.get()) return;
         String secondary = Settings.SECONDARY_CAPTION_LANGUAGE.get();
-        if ("off".equalsIgnoreCase(secondary)) {
-            invalidateUploaded();
-            return;
+        String videoAtStart;
+        synchronized (CaptionTracks.class) {
+            if ("off".equalsIgnoreCase(secondary)) {
+                invalidateUploaded();
+                return;
+            }
+            videoAtStart = video;
         }
         String primary = Settings.PREFERRED_CAPTION_LANGUAGE.get();
         boolean appLanguage = "default".equalsIgnoreCase(primary);
@@ -670,12 +667,21 @@ public final class CaptionTracks {
         UploadedCandidate second = first != null
                 && first.language.equals(AutoTranslateCaptionsPatch.normalizeLanguageCode(secondary))
                 ? null : findUploadedTrack(catalog, secondary);
+        planUploadedTracks(videoAtStart, primary, secondary, first, second);
+    }
+
+    private static synchronized void planUploadedTracks(@Nullable String videoAtStart, String primary,
+            String secondary, @Nullable UploadedCandidate first, @Nullable UploadedCandidate second) {
+        if (!Settings.DUAL_CAPTIONS_ENABLED.get()) return;
+        String candidateVideo = first != null ? first.video : second != null ? second.video : null;
+        // Native catalog conversion can overlap a video change. Keep the newer selection.
+        if (!Objects.equals(video, videoAtStart) && !isCurrentVideo(candidateVideo)) return;
         if ((first == null && second == null)
                 || (first != null && second != null && !first.video.equals(second.video))) {
             invalidateUploaded();
             return;
         }
-        onVideoId(first != null ? first.video : second.video);
+        onVideoId(candidateVideo);
         String key = primary + "|" + secondary;
         if (key.equals(uploadedKey)) return;
 
@@ -830,7 +836,7 @@ public final class CaptionTracks {
                 if (fallback && sourceState != null && sourceState.captured != null) {
                     Captured captured = sourceState.captured;
                     state.captured = captured;
-                    attachTranslation(captured.track.withSecondary(secondaryLanguage()), captured.policy, state);
+                    attachTranslation(captured.track.withSecondary(secondaryLanguage()), captured, state);
                 }
                 timeline.patch_setBlockState(state);
                 return timeline;

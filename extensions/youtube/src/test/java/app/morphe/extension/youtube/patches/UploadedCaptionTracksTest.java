@@ -9,15 +9,20 @@ package app.morphe.extension.youtube.patches;
 
 import static org.junit.Assert.*;
 
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.junit.Test;
+import org.w3c.dom.Document;
 
 public class UploadedCaptionTracksTest {
     @SuppressWarnings("unchecked")
     @Test
-    public void prefetchedNativeTrackKeepsMetadataWithoutReplacingSelectedSession() throws Exception {
+    public void videoChangeDoesNotWaitForParserOrInstallLateCaptions() throws Exception {
         var type = Class.forName(CaptionTracks.class.getName() + "$Track");
         var constructor = type.getDeclaredConstructor(
             String.class, String.class, String.class, String.class, boolean.class, boolean.class);
@@ -33,22 +38,43 @@ public class UploadedCaptionTracksTest {
         Object oldSession = sessionField.get(null);
         ThreadLocal<Object> parsing = (ThreadLocal<Object>) parsingField.get(null);
         assertNotNull(parsing);
+        var workers = Executors.newFixedThreadPool(2);
+        var parsingStarted = new CountDownLatch(1);
+        var finishParsing = new CountDownLatch(1);
+        var state = new StableCaptionBlocks.State(false);
+        Document original = CaptionXml.read(
+                "<timedtext format='3'><body><p t='1000' d='1000'>Original</p></body></timedtext>"
+                        .getBytes(StandardCharsets.UTF_8));
+        Document slowDocument = (Document) Proxy.newProxyInstance(Document.class.getClassLoader(),
+                new Class<?>[]{Document.class}, (proxy, method, args) -> {
+                    parsingStarted.countDown();
+                    finishParsing.await();
+                    return method.invoke(original, args);
+                });
         try {
-            videoField.set(null, "other-video");
-            parsing.set(track);
-            var state = new StableCaptionBlocks.State(false);
-            CaptionTracks.observe(
-                CaptionXml.read(
-                    "<timedtext format='3'><body><p t='1000' d='1000'>Original</p></body></timedtext>"
-                        .getBytes(StandardCharsets.UTF_8)),
-                state);
+            videoField.set(null, "26P1KyvrmjI");
+            var capture = workers.submit(() -> {
+                parsing.set(track);
+                CaptionTracks.observe(slowDocument, state);
+            });
+            assertTrue(parsingStarted.await(5, TimeUnit.SECONDS));
+            workers.submit(() -> {
+                CaptionTracks.onVideoId("other-video");
+                // Local tests run without the injected patch flag.
+                videoField.set(null, "other-video");
+                return null;
+            }).get(5, TimeUnit.SECONDS);
+            finishParsing.countDown();
+            capture.get(5, TimeUnit.SECONDS);
             assertNotNull("cached prefetch must remain capturable when selected later", state.captured);
             assertNotNull(state.policy);
             assertNull("prefetch cannot become the active output", state.translation);
             assertSame(oldSession, sessionField.get(null));
         } finally {
+            finishParsing.countDown();
+            workers.shutdownNow();
+            workers.awaitTermination(5, TimeUnit.SECONDS);
             videoField.set(null, oldVideo);
-            parsing.remove();
         }
     }
     record Track(String language, String vss, String url)
